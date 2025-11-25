@@ -3,10 +3,14 @@ import torch.distributed.rpc as rpc
 import os
 import socket
 import time
+import warnings
 from .model import get_model
 from .utils import get_device
 from .dataset import get_imagenet_dataset
 from .stats_collector import StatsCollector
+
+# Suppress PyTorch distributed backend deprecation warning
+warnings.filterwarnings("ignore", message=".*Backend.*ProcessGroup.*deprecated.*")
 
 class Worker:
     def __init__(self, ps_rref, rank, world_size, dataset_url, val_dataset_url=None):

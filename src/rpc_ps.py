@@ -5,9 +5,13 @@ import threading
 import os
 import socket
 import time
+import warnings
 from .model import get_model
 from .utils import get_device
 from .stats_collector import StatsCollector
+
+# Suppress PyTorch distributed backend deprecation warning
+warnings.filterwarnings("ignore", message=".*Backend.*ProcessGroup.*deprecated.*")
 
 class ParameterServer:
     def __init__(self, num_classes=200, checkpoint_dir="checkpoints"):
