@@ -35,9 +35,10 @@ class Worker:
         self.loader = get_imagenet_dataset(dataset_url, batch_size=64, num_workers=2, train=True)
         
         # Load validation dataset if provided
+        # Use num_workers=0 for validation to avoid "fewer shards than workers" error
         self.val_loader = None
         if val_dataset_url:
-            self.val_loader = get_imagenet_dataset(val_dataset_url, batch_size=64, num_workers=2, train=False)
+            self.val_loader = get_imagenet_dataset(val_dataset_url, batch_size=64, num_workers=0, train=False)
         
     def train(self, epochs=1):
         for epoch in range(epochs):
