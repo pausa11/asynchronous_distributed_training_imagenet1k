@@ -1,0 +1,133 @@
+import torch
+import torch.distributed.rpc as rpc
+import os
+import socket
+import time
+from .model import get_model
+from .utils import get_device
+from .dataset import get_imagenet_dataset
+from .stats_collector import StatsCollector
+
+class Worker:
+    def __init__(self, ps_rref, rank, world_size, dataset_url):
+        self.ps_rref = ps_rref
+        self.rank = rank
+        self.device = get_device()
+        self.model = get_model(num_classes=200).to(self.device)
+        self.criterion = torch.nn.CrossEntropyLoss()
+        
+        # Initialize Stats Collector
+        hostname = socket.gethostname()
+        self.stats = StatsCollector(f"{hostname}_worker{rank}")
+        self.stats.log_parameters({
+            "role": "worker",
+            "rank": rank,
+            "world_size": world_size,
+            "dataset_url": dataset_url,
+            "batch_size": 64,
+            "device": str(self.device)
+        })
+        self.stats.start_monitoring()
+        
+        # Load dataset
+        # Note: In a real distributed setting, we'd shard the dataset based on rank
+        self.loader = get_imagenet_dataset(dataset_url, batch_size=64, num_workers=2, train=True)
+        
+    def train(self, epochs=1):
+        for epoch in range(epochs):
+            self.train_epoch(epoch)
+
+    def train_epoch(self, epoch):
+        self.model.train()
+        total_loss = 0
+        correct = 0
+        total_samples = 0
+        
+        for i, (data, target) in enumerate(self.loader):
+            data, target = data.to(self.device), target.to(self.device)
+            
+            # 1. Pull latest weights from PS
+            # We assume ps_rref points to the PS node and we call a registered function
+            # For simplicity, let's assume we call 'get_global_weights' on "ps"
+            weights = rpc.rpc_sync("ps", get_global_weights)
+            self.model.load_state_dict(weights)
+            
+            # 2. Forward pass
+            output = self.model(data)
+            loss = self.criterion(output, target)
+            
+            # Calculate accuracy
+            pred = output.argmax(dim=1, keepdim=True)
+            correct_batch = pred.eq(target.view_as(pred)).sum().item()
+            correct += correct_batch
+            total_samples += len(target)
+            total_loss += loss.item()
+            
+            # 3. Backward pass
+            self.model.zero_grad()
+            loss.backward()
+            
+            # 4. Push gradients to PS
+            grads = {k: v.grad.cpu() for k, v in self.model.named_parameters() if v.grad is not None}
+            rpc.rpc_sync("ps", update_global_parameters, args=(grads,))
+            
+            # Log metrics
+            accuracy = 100. * correct_batch / len(target)
+            self.stats.log_training_metrics({
+                "epoch": epoch,
+                "batch": i,
+                "loss": loss.item(),
+                "accuracy": accuracy
+            })
+            
+            if i % 10 == 0:
+                print(f"Rank {self.rank}, Epoch {epoch}, Batch {i}, Loss: {loss.item():.4f}, Acc: {accuracy:.2f}%")
+        
+        avg_loss = total_loss / len(self.loader)
+        avg_acc = 100. * correct / total_samples
+        print(f"Rank {self.rank}, Epoch {epoch} Summary: Average Loss: {avg_loss:.4f}, Average Accuracy: {avg_acc:.2f}%")
+        
+        # Report metric to PS for checkpointing
+        rpc.rpc_sync("ps", report_global_metric, args=(avg_acc,))
+
+# Helper functions to be called by RPC
+from .rpc_ps import get_global_weights, update_global_parameters, report_global_metric
+
+def run_worker(rank, world_size, master_addr, master_port, dataset_url, epochs):
+    os.environ['MASTER_ADDR'] = master_addr
+    os.environ['MASTER_PORT'] = master_port
+    
+    options = rpc.TensorPipeRpcBackendOptions(
+        num_worker_threads=16,
+        rpc_timeout=60
+    )
+    
+    rpc.init_rpc(
+        f"worker{rank}",
+        rank=rank,
+        world_size=world_size,
+        rpc_backend_options=options
+    )
+    
+    print(f"Worker {rank} started...")
+    
+    # Start training
+    worker = Worker(None, rank, world_size, dataset_url)
+    worker.train(epochs)
+    
+    worker.stats.stop_monitoring()
+    rpc.shutdown()
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rank", type=int, default=1)
+    parser.add_argument("--world_size", type=int, default=3)
+    parser.add_argument("--master_addr", type=str, default="localhost")
+    parser.add_argument("--master_port", type=str, default="29500")
+    parser.add_argument("--dataset_url", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=1)
+    args = parser.parse_args()
+    
+    run_worker(args.rank, args.world_size, args.master_addr, args.master_port, args.dataset_url, args.epochs)

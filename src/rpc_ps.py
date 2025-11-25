@@ -1,0 +1,205 @@
+import torch
+import torch.distributed.rpc as rpc
+from torch.distributed.rpc import RRef
+import threading
+import os
+import socket
+import time
+from .model import get_model
+from .utils import get_device
+from .stats_collector import StatsCollector
+
+class ParameterServer:
+    def __init__(self, num_classes=200, checkpoint_dir="checkpoints"):
+        self.lock = threading.Lock()
+        self.model = get_model(num_classes=num_classes).to(get_device())
+        # Use SGD for simplicity, but could be configurable
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        
+        self.checkpoint_dir = checkpoint_dir
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.best_acc = 0.0
+        
+        # Try to load checkpoint
+        self.load_checkpoint()
+        
+        # Initialize Stats Collector
+        hostname = socket.gethostname()
+        self.stats = StatsCollector(f"{hostname}_ps")
+        self.stats.log_parameters({
+            "role": "parameter_server",
+            "model": "resnet18",
+            "optimizer": "SGD",
+            "lr": 0.01,
+            "momentum": 0.9,
+            "device": str(get_device()),
+            "checkpoint_dir": checkpoint_dir
+        })
+        self.stats.start_monitoring()
+        
+        # Start background saver for 'last' checkpoint
+        self.saver_thread = threading.Thread(target=self._periodic_saver, daemon=True)
+        self.saver_thread.start()
+        
+        print(f"Parameter Server initialized on {get_device()}")
+
+    def load_checkpoint(self):
+        """Loads the best or last checkpoint if available."""
+        last_ckpt = os.path.join(self.checkpoint_dir, "last.pth")
+        best_ckpt = os.path.join(self.checkpoint_dir, "best.pth")
+        
+        ckpt_path = None
+        if os.path.exists(last_ckpt):
+            ckpt_path = last_ckpt
+        elif os.path.exists(best_ckpt):
+            ckpt_path = best_ckpt
+            
+        if ckpt_path:
+            print(f"Loading checkpoint from {ckpt_path}...")
+            try:
+                checkpoint = torch.load(ckpt_path, map_location=get_device())
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.best_acc = checkpoint.get('best_acc', 0.0)
+                print(f"Checkpoint loaded. Best accuracy so far: {self.best_acc:.2f}%")
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}")
+
+    def save_checkpoint(self, filename="last.pth"):
+        """Saves the current model state."""
+        save_path = os.path.join(self.checkpoint_dir, filename)
+        # We should probably lock while saving to get a consistent state
+        with self.lock:
+            state = {
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'best_acc': self.best_acc,
+                'timestamp': time.time()
+            }
+        
+        # Save to a temp file then rename to avoid corruption
+        tmp_path = save_path + ".tmp"
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, save_path)
+        print(f"Checkpoint saved to {save_path}")
+
+    def _periodic_saver(self, interval=600):
+        """Periodically saves the 'last' checkpoint."""
+        while True:
+            time.sleep(interval)
+            self.save_checkpoint("last.pth")
+
+    def get_weights(self):
+        """
+        Returns the current model weights to the worker.
+        """
+        # No lock needed for reading, or maybe a reader lock if strict consistency required.
+        # For async training, reading stale weights is acceptable.
+        return {k: v.cpu() for k, v in self.model.state_dict().items()}
+
+    def remote_update_parameters(self, gradients):
+        """
+        Updates the model parameters with the received gradients.
+        Uses a lock to ensure atomic updates.
+        """
+        with self.lock:
+            # Zero grads
+            self.optimizer.zero_grad()
+            
+            # Apply gradients
+            for name, param in self.model.named_parameters():
+                if name in gradients:
+                    # Move grad to device and set
+                    if param.grad is None:
+                        param.grad = gradients[name].to(param.device)
+                    else:
+                        param.grad += gradients[name].to(param.device)
+            
+            # Step optimizer
+            self.optimizer.step()
+            
+        return True
+
+    def report_metric(self, accuracy):
+        """
+        Updates best accuracy and saves best checkpoint if improved.
+        """
+        with self.lock:
+            if accuracy > self.best_acc:
+                print(f"New best accuracy: {accuracy:.2f}% (was {self.best_acc:.2f}%)")
+                self.best_acc = accuracy
+                # Save best checkpoint immediately (or trigger it)
+                # We can do it in a separate thread to not block RPC, but for now let's do it here
+                # actually, saving might take time, better to do it async or just quick copy?
+                # For simplicity, let's save directly but maybe we should optimize later.
+                threading.Thread(target=self.save_checkpoint, args=("best.pth",)).start()
+        return True
+
+# Global PS instance
+global_ps = None
+
+def get_global_weights():
+    global global_ps
+    if global_ps is None:
+        print("ERROR: global_ps is None")
+        return {}
+    return global_ps.get_weights()
+
+def update_global_parameters(grads):
+    global global_ps
+    if global_ps is None:
+        print("ERROR: global_ps is None")
+        return False
+    return global_ps.remote_update_parameters(grads)
+
+def report_global_metric(accuracy):
+    global global_ps
+    if global_ps is None:
+        print("ERROR: global_ps is None")
+        return False
+    return global_ps.report_metric(accuracy)
+
+def run_ps(rank, world_size, master_addr, master_port, checkpoint_dir="checkpoints"):
+    global global_ps
+    global_ps = ParameterServer(checkpoint_dir=checkpoint_dir)
+    
+    os.environ['MASTER_ADDR'] = master_addr
+    os.environ['MASTER_PORT'] = master_port
+    
+    options = rpc.TensorPipeRpcBackendOptions(
+        num_worker_threads=16,
+        rpc_timeout=60  # 60s timeout
+    )
+    
+    rpc.init_rpc(
+        f"ps",
+        rank=rank,
+        world_size=world_size,
+        rpc_backend_options=options
+    )
+    
+    print("Parameter Server is running...")
+    # In a real scenario, we'd need a way to stop the PS gracefully or wait for workers.
+    # For now, we rely on RPC shutdown or external signal.
+    # But since run_ps blocks until shutdown? No, rpc.shutdown() blocks until all workers are done?
+    # Actually rpc.shutdown() waits for all workers to exit if they are joined.
+    
+    # We need to access the global_ps to stop stats.
+    if global_ps:
+        global_ps.save_checkpoint("last.pth") # Save on exit
+        global_ps.stats.stop_monitoring()
+        
+    rpc.shutdown()
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--world_size", type=int, default=3)
+    parser.add_argument("--master_addr", type=str, default="localhost")
+    parser.add_argument("--master_port", type=str, default="29500")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    args = parser.parse_args()
+    
+    run_ps(args.rank, args.world_size, args.master_addr, args.master_port, args.checkpoint_dir)
