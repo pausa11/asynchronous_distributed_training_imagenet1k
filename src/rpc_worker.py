@@ -8,9 +8,42 @@ from .model import get_model
 from .utils import get_device
 from .dataset import get_imagenet_dataset
 from .stats_collector import StatsCollector
+from functools import wraps
 
 # Suppress PyTorch distributed backend deprecation warning
 warnings.filterwarnings("ignore", message=".*Backend.*ProcessGroup.*deprecated.*")
+
+def rpc_retry(max_retries=3, initial_delay=1.0, backoff_factor=2.0):
+    """Decorator to retry RPC calls with exponential backoff."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+            
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except RuntimeError as e:
+                    last_exception = e
+                    error_msg = str(e)
+                    # Check if it's a connection error
+                    if "EOF" in error_msg or "EINVAL" in error_msg or "connection" in error_msg.lower():
+                        if attempt < max_retries - 1:
+                            print(f"RPC call failed (attempt {attempt + 1}/{max_retries}): {error_msg}. Retrying in {delay}s...")
+                            time.sleep(delay)
+                            delay *= backoff_factor
+                        else:
+                            print(f"RPC call failed after {max_retries} attempts: {error_msg}")
+                            raise
+                    else:
+                        # Not a connection error, raise immediately
+                        raise
+            
+            # Should not reach here, but just in case
+            raise last_exception
+        return wrapper
+    return decorator
 
 class Worker:
     def __init__(self, ps_rref, rank, world_size, dataset_url, val_dataset_url=None):
@@ -64,11 +97,15 @@ class Worker:
         for i, (data, target) in enumerate(self.loader):
             data, target = data.to(self.device), target.to(self.device)
             
-            # 1. Pull latest weights from PS
-            # We assume ps_rref points to the PS node and we call a registered function
-            # For simplicity, let's assume we call 'get_global_weights' on "ps"
-            weights = rpc.rpc_sync("ps", get_global_weights)
-            self.model.load_state_dict(weights)
+            # 1. Pull latest weights from PS (CPU) with retry logic
+            try:
+                weights_cpu = self._get_weights_with_retry()
+                # Move weights to worker's device (MPS) for computation
+                weights = {k: v.to(self.device) for k, v in weights_cpu.items()}
+                self.model.load_state_dict(weights)
+            except Exception as e:
+                print(f"Failed to get weights from PS: {e}. Skipping batch {i}.")
+                continue
             
             # 2. Forward pass
             output = self.model(data)
@@ -86,9 +123,13 @@ class Worker:
             self.model.zero_grad()
             loss.backward()
             
-            # 4. Push gradients to PS
-            grads = {k: v.grad.cpu() for k, v in self.model.named_parameters() if v.grad is not None}
-            rpc.rpc_sync("ps", update_global_parameters, args=(grads,))
+            # 4. Push gradients to PS with retry logic
+            # Move gradients to CPU for RPC serialization
+            try:
+                grads = {k: v.grad.cpu() for k, v in self.model.named_parameters() if v.grad is not None}
+                self._update_parameters_with_retry(grads)
+            except Exception as e:
+                print(f"Failed to push gradients to PS: {e}. Continuing with next batch.")
             
             # Log metrics
             accuracy = 100. * correct_batch / len(target)
@@ -106,6 +147,16 @@ class Worker:
         avg_acc = 100. * correct / total_samples if total_samples > 0 else 0
         print(f"Rank {self.rank}, Epoch {epoch} Training Summary: Average Loss: {avg_loss:.4f}, Average Accuracy: {avg_acc:.2f}%")
     
+    @rpc_retry(max_retries=5, initial_delay=1.0, backoff_factor=2.0)
+    def _get_weights_with_retry(self):
+        """Get weights from PS with retry logic."""
+        return rpc.rpc_sync("ps", get_global_weights, timeout=120)
+    
+    @rpc_retry(max_retries=5, initial_delay=1.0, backoff_factor=2.0)
+    def _update_parameters_with_retry(self, grads):
+        """Update parameters on PS with retry logic."""
+        return rpc.rpc_sync("ps", update_global_parameters, args=(grads,), timeout=120)
+    
     def validate_epoch(self, epoch):
         """Validate the model on the validation set."""
         self.model.eval()
@@ -118,9 +169,15 @@ class Worker:
             for i, (data, target) in enumerate(self.val_loader):
                 data, target = data.to(self.device), target.to(self.device)
                 
-                # Pull latest weights from PS
-                weights = rpc.rpc_sync("ps", get_global_weights)
-                self.model.load_state_dict(weights)
+                # Pull latest weights from PS (CPU) with retry logic
+                try:
+                    weights_cpu = self._get_weights_with_retry()
+                    # Move weights to worker's device (MPS) for computation
+                    weights = {k: v.to(self.device) for k, v in weights_cpu.items()}
+                    self.model.load_state_dict(weights)
+                except Exception as e:
+                    print(f"Failed to get weights from PS during validation: {e}. Skipping batch {i}.")
+                    continue
                 
                 # Forward pass only
                 output = self.model(data)
@@ -161,7 +218,7 @@ def run_worker(rank, world_size, master_addr, master_port, dataset_url, val_data
     
     options = rpc.TensorPipeRpcBackendOptions(
         num_worker_threads=16,
-        rpc_timeout=60
+        rpc_timeout=300  # Increased from 60s to 300s for better stability
     )
     
     rpc.init_rpc(

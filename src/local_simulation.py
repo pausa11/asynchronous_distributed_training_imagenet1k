@@ -7,7 +7,7 @@ from src.rpc_worker import run_worker
 def run_simulation():
     world_size = 2
     master_addr = "localhost"
-    master_port = "30004"
+    master_port = "30005"
     # Use public HTTP URL to stream data from GCS bucket
     # This avoids gsutil authentication issues in multiprocessing and saves local disk space
     dataset_url = "https://storage.googleapis.com/caso-estudio-2/tiny-imagenet-wds/train/train-{000000..000002}.tar"

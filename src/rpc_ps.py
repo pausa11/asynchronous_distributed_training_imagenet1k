@@ -16,7 +16,10 @@ warnings.filterwarnings("ignore", message=".*Backend.*ProcessGroup.*deprecated.*
 class ParameterServer:
     def __init__(self, num_classes=200, checkpoint_dir="checkpoints"):
         self.lock = threading.Lock()
-        self.model = get_model(num_classes=num_classes).to(get_device())
+        # Force CPU for RPC compatibility - PS must use CPU for tensor serialization
+        self.device = torch.device("cpu")
+        self.model = get_model(num_classes=num_classes).to(self.device)
+        print(f"Parameter Server using device: {self.device} (forced CPU for RPC compatibility)")
         # Use SGD for simplicity, but could be configurable
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
         
@@ -36,7 +39,7 @@ class ParameterServer:
             "optimizer": "SGD",
             "lr": 0.01,
             "momentum": 0.9,
-            "device": str(get_device()),
+            "device": str(self.device),
             "checkpoint_dir": checkpoint_dir
         })
         self.stats.start_monitoring()
@@ -61,7 +64,7 @@ class ParameterServer:
         if ckpt_path:
             print(f"Loading checkpoint from {ckpt_path}...")
             try:
-                checkpoint = torch.load(ckpt_path, map_location=get_device())
+                checkpoint = torch.load(ckpt_path, map_location=self.device)
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.best_acc = checkpoint.get('best_acc', 0.0)
@@ -172,7 +175,7 @@ def run_ps(rank, world_size, master_addr, master_port, checkpoint_dir="checkpoin
     
     options = rpc.TensorPipeRpcBackendOptions(
         num_worker_threads=16,
-        rpc_timeout=60  # 60s timeout
+        rpc_timeout=300  # Increased from 60s to 300s for better stability
     )
     
     rpc.init_rpc(
