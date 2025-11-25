@@ -4,15 +4,45 @@ from torch.utils.data import DataLoader
 import os
 
 
+def load_class_mapping():
+    """
+    Load the class-to-index mapping from wnids.txt.
+    This ensures consistent label mapping across training and validation.
+    """
+    # Path to wnids.txt (relative to project root)
+    wnids_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "data", "tiny-imagenet-200", "wnids.txt"
+    )
+    
+    if not os.path.exists(wnids_path):
+        raise FileNotFoundError(f"wnids.txt not found at {wnids_path}")
+    
+    with open(wnids_path, 'r') as f:
+        class_names = [line.strip() for line in f.readlines()]
+    
+    # Create mapping from class name to index
+    class_to_idx = {cls: idx for idx, cls in enumerate(class_names)}
+    
+    return class_to_idx
+
+
+# Load the class mapping once at module level
+CLASS_TO_IDX = load_class_mapping()
+
+
 class TransformApplier:
     def __init__(self, train=True):
         self.transform = make_transform(train=train)
     
     def __call__(self, sample):
         image, label = sample
-        # Hash the class string to an integer for simulation purposes
-        # In production, use a proper mapping (wnids.txt)
-        label_id = int(hash(label) % 200)
+        # Use proper class-to-index mapping
+        label_id = CLASS_TO_IDX.get(label, -1)
+        
+        if label_id == -1:
+            raise ValueError(f"Unknown class label: {label}")
+        
         return self.transform(image), label_id
 
 def decode_cls(data):
