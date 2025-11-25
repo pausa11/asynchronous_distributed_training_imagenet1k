@@ -10,13 +10,14 @@ def run_simulation():
     master_port = "30004"
     # Use public HTTP URL to stream data from GCS bucket
     # This avoids gsutil authentication issues in multiprocessing and saves local disk space
-    dataset_url = "https://storage.googleapis.com/caso-estudio-2/tiny-imagenet-wds/train/train-{000000..000002}.tar" 
+    dataset_url = "https://storage.googleapis.com/caso-estudio-2/tiny-imagenet-wds/train/train-{000000..000002}.tar"
+    val_dataset_url = "https://storage.googleapis.com/caso-estudio-2/tiny-imagenet-wds/val/val-000000.tar"
     
     mp.set_start_method("spawn", force=True)
     
     checkpoint_dir = "checkpoints"
     p0 = mp.Process(target=run_ps, args=(0, world_size, master_addr, master_port, checkpoint_dir))
-    p1 = mp.Process(target=run_worker, args=(1, world_size, master_addr, master_port, dataset_url, 5))
+    p1 = mp.Process(target=run_worker, args=(1, world_size, master_addr, master_port, dataset_url, val_dataset_url, 5))
     
     p0.start()
     p1.start()
