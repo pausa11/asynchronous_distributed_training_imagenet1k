@@ -90,8 +90,6 @@ class Worker:
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        correct = 0
-        total_samples = 0
         num_batches = 0
         
         for i, (data, target) in enumerate(self.loader):
@@ -111,11 +109,7 @@ class Worker:
             output = self.model(data)
             loss = self.criterion(output, target)
             
-            # Calculate accuracy
-            pred = output.argmax(dim=1, keepdim=True)
-            correct_batch = pred.eq(target.view_as(pred)).sum().item()
-            correct += correct_batch
-            total_samples += len(target)
+            # Track loss only (accuracy calculated in validation)
             total_loss += loss.item()
             num_batches += 1
             
@@ -131,21 +125,21 @@ class Worker:
             except Exception as e:
                 print(f"Failed to push gradients to PS: {e}. Continuing with next batch.")
             
-            # Log metrics
-            accuracy = 100. * correct_batch / len(target)
-            self.stats.log_training_metrics({
-                "epoch": epoch,
-                "batch": i,
-                "loss": loss.item(),
-                "accuracy": accuracy
-            })
-            
+            # Log only loss (reduced overhead)
             if i % 10 == 0:
-                print(f"Rank {self.rank}, Epoch {epoch}, Batch {i}, Loss: {loss.item():.4f}, Acc: {accuracy:.2f}%")
+                print(f"Rank {self.rank}, Epoch {epoch}, Batch {i}, Loss: {loss.item():.4f}")
+            
+            # Log to stats every 100 batches to reduce I/O overhead
+            if i % 100 == 0:
+                self.stats.log_training_metrics({
+                    "epoch": epoch,
+                    "batch": i,
+                    "loss": loss.item(),
+                    "accuracy": None  # Only calculated in validation
+                })
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
-        avg_acc = 100. * correct / total_samples if total_samples > 0 else 0
-        print(f"Rank {self.rank}, Epoch {epoch} Training Summary: Average Loss: {avg_loss:.4f}, Average Accuracy: {avg_acc:.2f}%")
+        print(f"Rank {self.rank}, Epoch {epoch} Training Summary: Average Loss: {avg_loss:.4f}")
     
     @rpc_retry(max_retries=5, initial_delay=1.0, backoff_factor=2.0)
     def _get_weights_with_retry(self):
