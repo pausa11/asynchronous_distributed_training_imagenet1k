@@ -68,9 +68,15 @@ def get_imagenet_dataset(url, batch_size=64, num_workers=4, train=True):
     # Apply transforms
     applier = TransformApplier(train=train)
 
+    # Build pipeline - shuffle only for training
+    dataset = wds.WebDataset(url, shardshuffle=1000 if train else False)
+    
+    # Apply shuffle only during training, not validation
+    if train:
+        dataset = dataset.shuffle(1000)
+    
     dataset = (
-        wds.WebDataset(url, shardshuffle=1000 if train else False)
-        .shuffle(1000)
+        dataset
         .decode(wds.handle_extension("cls", decode_cls), "pil")
         .to_tuple("jpg;png", "cls")
         .map(applier)
@@ -98,3 +104,43 @@ def make_transform(train=True):
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+
+
+def get_imagenet_folder_dataset(data_dir, batch_size=64, num_workers=4, train=True):
+    """
+    Creates a DataLoader for ImageNet/Tiny-ImageNet from uncompressed directory structure.
+    This matches the approach used in train_simple.py (proven to work).
+    
+    Args:
+        data_dir (str): Path to the dataset directory (local or gcsfuse-mounted).
+                       Should contain 'train/' and 'val/' subdirectories.
+        batch_size (int): Batch size.
+        num_workers (int): Number of worker processes.
+        train (bool): Whether to load training or validation set.
+    
+    Returns:
+        DataLoader: PyTorch DataLoader.
+    """
+    from torchvision import datasets
+    import os
+    
+    # Get transforms (same as WebDataset version)
+    transform = make_transform(train=train)
+    
+    # Determine subdirectory
+    subdir = 'train' if train else 'val'
+    dataset_path = os.path.join(data_dir, subdir)
+    
+    # Use ImageFolder for easy loading
+    dataset = datasets.ImageFolder(dataset_path, transform=transform)
+    
+    # Create DataLoader
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=train,  # Shuffle only for training
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    
+    return loader

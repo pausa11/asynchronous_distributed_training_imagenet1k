@@ -46,7 +46,7 @@ def rpc_retry(max_retries=3, initial_delay=1.0, backoff_factor=2.0):
     return decorator
 
 class Worker:
-    def __init__(self, ps_rref, rank, world_size, dataset_url, val_dataset_url=None):
+    def __init__(self, ps_rref, rank, world_size, dataset_url, val_dataset_url=None, use_webdataset=False):
         self.ps_rref = ps_rref
         self.rank = rank
         self.device = get_device()
@@ -63,20 +63,31 @@ class Worker:
             "dataset_url": dataset_url,
             "val_dataset_url": val_dataset_url,
             "batch_size": 64,
-            "device": str(self.device)
+            "device": str(self.device),
+            "use_webdataset": use_webdataset
         })
         self.stats.start_monitoring()
         
         # Load training dataset
-        # Note: In a real distributed setting, we'd shard the dataset based on rank
-        self.loader = get_imagenet_dataset(dataset_url, batch_size=64, num_workers=2, train=True)
+        if use_webdataset:
+            print(f"📦 [Worker {rank}] Using WebDataset from: {dataset_url}")
+            from .dataset import get_imagenet_dataset
+            self.loader = get_imagenet_dataset(dataset_url, batch_size=64, num_workers=2, train=True)
+        else:
+            print(f"📁 [Worker {rank}] Using ImageFolder from: {dataset_url}")
+            from .dataset import get_imagenet_folder_dataset
+            self.loader = get_imagenet_folder_dataset(dataset_url, batch_size=64, num_workers=2, train=True)
         
         # Load validation dataset if provided
-        # Use num_workers=0 for validation to avoid "fewer shards than workers" error
         self.val_loader = None
         if val_dataset_url:
             print(f"🔍 [Worker {rank}] Loading validation data from: {val_dataset_url}")
-            self.val_loader = get_imagenet_dataset(val_dataset_url, batch_size=64, num_workers=0, train=False)
+            if use_webdataset:
+                from .dataset import get_imagenet_dataset
+                self.val_loader = get_imagenet_dataset(val_dataset_url, batch_size=64, num_workers=0, train=False)
+            else:
+                from .dataset import get_imagenet_folder_dataset
+                self.val_loader = get_imagenet_folder_dataset(val_dataset_url, batch_size=64, num_workers=0, train=False)
             print(f"✓ [Worker {rank}] Validation loader created successfully")
         
     def train(self, epochs=1):
@@ -161,21 +172,24 @@ class Worker:
         total_samples = 0
         num_batches = 0
         
+        # Load weights ONCE at the beginning of validation (not per batch!)
+        # This ensures consistent validation metrics, matching train_simple.py behavior
+        try:
+            print(f"🔄 [Worker {self.rank}] Loading model weights for validation...")
+            weights_cpu = self._get_weights_with_retry()
+            weights = {k: v.to(self.device) for k, v in weights_cpu.items()}
+            self.model.load_state_dict(weights)
+            print(f"✓ [Worker {self.rank}] Model weights loaded successfully")
+        except Exception as e:
+            print(f"❌ [Worker {self.rank}] Failed to get weights from PS for validation: {e}")
+            print(f"⚠️  Validation will be skipped for epoch {epoch}")
+            return 0.0
+        
         with torch.no_grad():
             for i, (data, target) in enumerate(self.val_loader):
                 data, target = data.to(self.device), target.to(self.device)
                 
-                # Pull latest weights from PS (CPU) with retry logic
-                try:
-                    weights_cpu = self._get_weights_with_retry()
-                    # Move weights to worker's device (MPS) for computation
-                    weights = {k: v.to(self.device) for k, v in weights_cpu.items()}
-                    self.model.load_state_dict(weights)
-                except Exception as e:
-                    print(f"Failed to get weights from PS during validation: {e}. Skipping batch {i}.")
-                    continue
-                
-                # Forward pass only
+                # Forward pass only (weights already loaded above)
                 output = self.model(data)
                 loss = self.criterion(output, target)
                 
@@ -208,7 +222,7 @@ class Worker:
 # Helper functions to be called by RPC
 from .rpc_ps import get_global_weights, update_global_parameters, report_global_metric
 
-def run_worker(rank, world_size, master_addr, master_port, dataset_url, val_dataset_url, epochs):
+def run_worker(rank, world_size, master_addr, master_port, dataset_url, val_dataset_url, epochs, use_webdataset=False):
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = master_port
     
@@ -227,8 +241,9 @@ def run_worker(rank, world_size, master_addr, master_port, dataset_url, val_data
     print(f"Worker {rank} started...")
     
     # Start training
-    worker = Worker(None, rank, world_size, dataset_url, val_dataset_url)
+    worker = Worker(None, rank, world_size, dataset_url, val_dataset_url, use_webdataset)
     worker.train(epochs)
+
     
     worker.stats.stop_monitoring()
     rpc.shutdown()
