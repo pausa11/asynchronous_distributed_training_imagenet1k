@@ -75,7 +75,9 @@ class Worker:
         # Use num_workers=0 for validation to avoid "fewer shards than workers" error
         self.val_loader = None
         if val_dataset_url:
+            print(f"🔍 [Worker {rank}] Loading validation data from: {val_dataset_url}")
             self.val_loader = get_imagenet_dataset(val_dataset_url, batch_size=64, num_workers=0, train=False)
+            print(f"✓ [Worker {rank}] Validation loader created successfully")
         
     def train(self, epochs=1):
         for epoch in range(epochs):
