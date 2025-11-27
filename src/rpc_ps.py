@@ -218,36 +218,22 @@ def run_ps(rank, world_size, master_addr, master_port, checkpoint_dir="checkpoin
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = master_port
     
-    # Fix for macOS network interface detection
-    # Force Gloo to use the correct network interface
+    # Fix for macOS network interface detection and IPv6 issues
+    # Force Gloo to use IPv4 only (Gloo has issues with IPv6 on macOS)
+    os.environ['GLOO_SOCKET_FAMILY'] = 'AF_INET'  # Force IPv4
+    
     if master_addr != "localhost" and master_addr != "127.0.0.1":
-        # Try to detect the network interface automatically
-        import socket
-        import subprocess
-        try:
-            # Get the network interface name for the IP
-            result = subprocess.run(['ifconfig'], capture_output=True, text=True)
-            lines = result.stdout.split('\n')
-            current_iface = None
-            for line in lines:
-                if line and not line.startswith('\t') and not line.startswith(' '):
-                    # This is an interface name line
-                    current_iface = line.split(':')[0]
-                elif 'inet ' in line and master_addr in line:
-                    # Found the interface with our IP
-                    if current_iface:
-                        os.environ['GLOO_SOCKET_IFNAME'] = current_iface
-                        print(f"Setting GLOO_SOCKET_IFNAME={current_iface}")
-                        break
-        except Exception as e:
-            print(f"Warning: Could not auto-detect network interface: {e}")
-            # Fallback: try common macOS interface names
-            os.environ['GLOO_SOCKET_IFNAME'] = 'en0'
-            print("Using fallback interface: en0")
+        # Set the network interface
+        os.environ['GLOO_SOCKET_IFNAME'] = 'en0'
+        os.environ['TP_SOCKET_IFNAME'] = 'en0'
+        print(f"Setting network interface to en0 (IPv4 only)")
+    else:
+        print(f"Using localhost (IPv4)")
     
     options = rpc.TensorPipeRpcBackendOptions(
         num_worker_threads=16,
-        rpc_timeout=300  # Increased from 60s to 300s for better stability
+        rpc_timeout=300,  # Increased from 60s to 300s for better stability
+        _transports=["uv"]  # Use UV transport which is more stable on macOS
     )
     
     rpc.init_rpc(

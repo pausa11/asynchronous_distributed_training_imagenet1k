@@ -291,33 +291,20 @@ def run_worker(rank, world_size, master_addr, master_port, dataset_url, val_data
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = master_port
     
-    # Fix for macOS network interface detection
+    # Fix for macOS network interface detection and IPv6 issues
+    os.environ['GLOO_SOCKET_FAMILY'] = 'AF_INET'  # Force IPv4
+    
     if master_addr != "localhost" and master_addr != "127.0.0.1":
-        # Try common interface names
-        import subprocess
-        try:
-            result = subprocess.run(['ifconfig'], capture_output=True, text=True)
-            lines = result.stdout.split('\n')
-            # Look for active interfaces with inet addresses
-            for i, line in enumerate(lines):
-                if line and not line.startswith('\t') and not line.startswith(' '):
-                    iface = line.split(':')[0]
-                    # Check next few lines for inet
-                    for j in range(i+1, min(i+10, len(lines))):
-                        if 'inet ' in lines[j] and '127.0.0.1' not in lines[j]:
-                            os.environ['GLOO_SOCKET_IFNAME'] = iface
-                            print(f"Setting GLOO_SOCKET_IFNAME={iface}")
-                            break
-                    if 'GLOO_SOCKET_IFNAME' in os.environ:
-                        break
-        except Exception as e:
-            print(f"Warning: Could not auto-detect network interface: {e}")
-            os.environ['GLOO_SOCKET_IFNAME'] = 'en0'
-            print("Using fallback interface: en0")
+        os.environ['GLOO_SOCKET_IFNAME'] = 'en0'
+        os.environ['TP_SOCKET_IFNAME'] = 'en0'
+        print(f"Setting network interface to en0 (IPv4 only)")
+    else:
+        print(f"Using localhost (IPv4)")
     
     options = rpc.TensorPipeRpcBackendOptions(
         num_worker_threads=16,
-        rpc_timeout=300  # Increased from 60s to 300s for better stability
+        rpc_timeout=300,  # Increased from 60s to 300s for better stability
+        _transports=["uv"]  # Use UV transport which is more stable on macOS
     )
     
     rpc.init_rpc(

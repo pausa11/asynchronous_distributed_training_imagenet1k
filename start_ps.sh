@@ -8,7 +8,9 @@ MASTER_PORT="30005"
 CHECKPOINT_DIR="checkpoints"
 
 # Obtener la IP de esta máquina
-# Intenta obtener la IP de la interfaz de red principal
+# Puedes sobrescribir manualmente la IP aquí si es necesario:
+# IP="192.168.20.3"
+# O dejar que se detecte automáticamente:
 IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "localhost")
 
 echo "=========================================="
