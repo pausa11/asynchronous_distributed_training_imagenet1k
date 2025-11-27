@@ -20,8 +20,8 @@ class ParameterServer:
         self.device = torch.device("cpu")
         self.model = get_model(num_classes=num_classes).to(self.device)
         print(f"Parameter Server using device: {self.device} (forced CPU for RPC compatibility)")
-        # Use SGD for simplicity, but could be configurable
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        # Use Adam optimizer to match train_simple.py
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
         
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -30,15 +30,23 @@ class ParameterServer:
         # Try to load checkpoint
         self.load_checkpoint()
         
+        # Track number of gradient updates received
+        self.update_count = 0
+        
+        # CRITICAL: Set model to eval mode
+        # The PS never does forward passes, so BatchNorm statistics are never updated.
+        # Keeping the model in eval() mode prevents BatchNorm from trying to use
+        # uninitialized running_mean/running_var, which causes validation to explode.
+        self.model.eval()
+        
         # Initialize Stats Collector
         hostname = socket.gethostname()
         self.stats = StatsCollector(f"{hostname}_ps")
         self.stats.log_parameters({
             "role": "parameter_server",
             "model": "resnet18",
-            "optimizer": "SGD",
-            "lr": 0.01,
-            "momentum": 0.9,
+            "optimizer": "Adam",
+            "lr": 0.001,
             "device": str(self.device),
             "checkpoint_dir": checkpoint_dir
         })
@@ -69,6 +77,8 @@ class ParameterServer:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.best_acc = checkpoint.get('best_acc', 0.0)
                 print(f"Checkpoint loaded. Best accuracy so far: {self.best_acc:.2f}%")
+                # Ensure model stays in eval mode after loading checkpoint
+                self.model.eval()
             except Exception as e:
                 print(f"Error loading checkpoint: {e}")
 
@@ -110,20 +120,28 @@ class ParameterServer:
         Uses a lock to ensure atomic updates.
         """
         with self.lock:
-            # Zero grads
+            # Zero grads first (critical!)
             self.optimizer.zero_grad()
             
-            # Apply gradients
+            # Apply gradients (REPLACE, not accumulate)
             for name, param in self.model.named_parameters():
                 if name in gradients:
-                    # Move grad to device and set
-                    if param.grad is None:
-                        param.grad = gradients[name].to(param.device)
-                    else:
-                        param.grad += gradients[name].to(param.device)
+                    # Move grad to device and REPLACE (not +=)
+                    param.grad = gradients[name].to(param.device)
             
             # Step optimizer
             self.optimizer.step()
+            
+            # Track updates
+            self.update_count += 1
+            
+            # Log every 100 updates
+            if self.update_count % 100 == 0:
+                print(f"[PS] Processed {self.update_count} gradient updates")
+                self.stats.log_training_metrics({
+                    "update_count": self.update_count,
+                    "type": "gradient_update"
+                })
             
         return True
 
@@ -142,6 +160,26 @@ class ParameterServer:
                 threading.Thread(target=self.save_checkpoint, args=("best.pth",)).start()
         return True
 
+    def update_batchnorm_stats(self, state_dict):
+        """
+        Updates the BatchNorm running statistics from a worker's state_dict.
+        This is critical because the PS never does forward passes, so its BN stats
+        never update naturally. We must sync them from workers.
+        """
+        with self.lock:
+            current_state = self.model.state_dict()
+            for name, param in state_dict.items():
+                # Only update running_mean and running_var
+                if "running_mean" in name or "running_var" in name or "num_batches_tracked" in name:
+                    if name in current_state:
+                        # Update the buffer on the correct device
+                        current_state[name].copy_(param.to(self.device))
+            
+            # Load the updated state back into the model
+            self.model.load_state_dict(current_state)
+            print("[PS] Updated BatchNorm statistics from worker")
+        return True
+
 # Global PS instance
 global_ps = None
 
@@ -158,6 +196,13 @@ def update_global_parameters(grads):
         print("ERROR: global_ps is None")
         return False
     return global_ps.remote_update_parameters(grads)
+
+def update_global_batchnorm_stats(state_dict):
+    global global_ps
+    if global_ps is None:
+        print("ERROR: global_ps is None")
+        return False
+    return global_ps.update_batchnorm_stats(state_dict)
 
 def report_global_metric(accuracy):
     global global_ps

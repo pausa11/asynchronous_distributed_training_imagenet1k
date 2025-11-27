@@ -91,7 +91,17 @@ class Worker:
             print(f"✓ [Worker {rank}] Validation loader created successfully")
         
     def train(self, epochs=1):
-        for epoch in range(epochs):
+        """Train for multiple epochs with validation."""
+        print("\n" + "="*60)
+        print("Starting training...")
+        print("="*60)
+        
+        for epoch in range(1, epochs + 1):
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch}/{epochs}")
+            print(f"{'='*60}")
+            
+            # Train
             self.train_epoch(epoch)
             
             # Validate after each epoch if validation set is available
@@ -99,32 +109,52 @@ class Worker:
                 val_acc = self.validate_epoch(epoch)
                 # Report validation accuracy to PS for checkpointing
                 rpc.rpc_sync("ps", report_global_metric, args=(val_acc,))
+            
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch} Complete")
+            print(f"{'='*60}\n")
+        
+        print("\n" + "="*60)
+        print("Training Complete!")
+        print("="*60)
 
     def train_epoch(self, epoch):
+        """Train for one epoch."""
         self.model.train()
-        total_loss = 0
-        num_batches = 0
         
-        for i, (data, target) in enumerate(self.loader):
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        start_time = time.time()
+        
+        for batch_idx, (data, target) in enumerate(self.loader):
             data, target = data.to(self.device), target.to(self.device)
             
             # 1. Pull latest weights from PS (CPU) with retry logic
             try:
                 weights_cpu = self._get_weights_with_retry()
                 # Move weights to worker's device (MPS) for computation
+                # Move weights to worker's device (MPS) for computation
                 weights = {k: v.to(self.device) for k, v in weights_cpu.items()}
-                self.model.load_state_dict(weights)
+                
+                # CRITICAL: Do NOT load BatchNorm statistics from PS during training!
+                # Since PS never updates BN stats (no forward pass), loading them would
+                # reset the worker's local running_mean/var to initial values every batch.
+                # We want the worker to accumulate BN stats locally, then sync to PS at end of epoch.
+                training_weights = {
+                    k: v for k, v in weights.items() 
+                    if "running_mean" not in k and "running_var" not in k and "num_batches_tracked" not in k
+                }
+                
+                self.model.load_state_dict(training_weights, strict=False)
             except Exception as e:
-                print(f"Failed to get weights from PS: {e}. Skipping batch {i}.")
+                print(f"Failed to get weights from PS: {e}. Skipping batch {batch_idx}.")
                 continue
             
             # 2. Forward pass
             output = self.model(data)
             loss = self.criterion(output, target)
-            
-            # Track loss only (accuracy calculated in validation)
-            total_loss += loss.item()
-            num_batches += 1
             
             # 3. Backward pass
             self.model.zero_grad()
@@ -138,21 +168,50 @@ class Worker:
             except Exception as e:
                 print(f"Failed to push gradients to PS: {e}. Continuing with next batch.")
             
-            # Log only loss (reduced overhead)
-            if i % 10 == 0:
-                print(f"Rank {self.rank}, Epoch {epoch}, Batch {i}, Loss: {loss.item():.4f}")
+            # Statistics
+            running_loss += loss.item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+            total += target.size(0)
+            
+            # Print progress
+            if batch_idx % 50 == 0:
+                batch_loss = loss.item()
+                batch_acc = 100. * correct / total
+                print(f'Epoch {epoch} [{batch_idx}/{len(self.loader)}] '
+                      f'Loss: {batch_loss:.4f} Acc: {batch_acc:.2f}%')
             
             # Log to stats every 100 batches to reduce I/O overhead
-            if i % 100 == 0:
+            if batch_idx % 100 == 0:
                 self.stats.log_training_metrics({
                     "epoch": epoch,
-                    "batch": i,
+                    "batch": batch_idx,
                     "loss": loss.item(),
-                    "accuracy": None  # Only calculated in validation
+                    "accuracy": 100. * correct / total
                 })
         
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0
-        print(f"Rank {self.rank}, Epoch {epoch} Training Summary: Average Loss: {avg_loss:.4f}")
+        epoch_time = time.time() - start_time
+        avg_loss = running_loss / len(self.loader)
+        avg_acc = 100. * correct / total
+        
+        print(f'\nEpoch {epoch} Training Summary:')
+        print(f'  Average Loss: {avg_loss:.4f}')
+        print(f'  Average Accuracy: {avg_acc:.2f}%')
+        print(f'  Time: {epoch_time:.2f}s')
+        
+        # Sync BatchNorm statistics to PS
+        # This is critical because the PS never does forward passes
+        print(f"🔄 [Worker {self.rank}] Syncing BatchNorm statistics to PS...")
+        try:
+            # Create a state dict with only BN stats
+            bn_stats = {
+                k: v.cpu() for k, v in self.model.state_dict().items() 
+                if "running_mean" in k or "running_var" in k or "num_batches_tracked" in k
+            }
+            rpc.rpc_sync("ps", update_global_batchnorm_stats, args=(bn_stats,))
+            print(f"✓ [Worker {self.rank}] BatchNorm statistics synced successfully")
+        except Exception as e:
+            print(f"❌ [Worker {self.rank}] Failed to sync BatchNorm stats: {e}")
     
     @rpc_retry(max_retries=5, initial_delay=1.0, backoff_factor=2.0)
     def _get_weights_with_retry(self):
@@ -167,47 +226,53 @@ class Worker:
     def validate_epoch(self, epoch):
         """Validate the model on the validation set."""
         self.model.eval()
-        total_loss = 0
+        
+        running_loss = 0.0
         correct = 0
-        total_samples = 0
-        num_batches = 0
+        total = 0
+        
+        start_time = time.time()
         
         # Load weights ONCE at the beginning of validation (not per batch!)
         # This ensures consistent validation metrics, matching train_simple.py behavior
         try:
-            print(f"🔄 [Worker {self.rank}] Loading model weights for validation...")
             weights_cpu = self._get_weights_with_retry()
             weights = {k: v.to(self.device) for k, v in weights_cpu.items()}
             self.model.load_state_dict(weights)
-            print(f"✓ [Worker {self.rank}] Model weights loaded successfully")
         except Exception as e:
-            print(f"❌ [Worker {self.rank}] Failed to get weights from PS for validation: {e}")
-            print(f"⚠️  Validation will be skipped for epoch {epoch}")
+            print(f"Failed to get weights from PS for validation: {e}")
+            print(f"Validation will be skipped for epoch {epoch}")
             return 0.0
         
         with torch.no_grad():
-            for i, (data, target) in enumerate(self.val_loader):
+            for batch_idx, (data, target) in enumerate(self.val_loader):
                 data, target = data.to(self.device), target.to(self.device)
                 
-                # Forward pass only (weights already loaded above)
+                # Forward pass
                 output = self.model(data)
                 loss = self.criterion(output, target)
                 
-                # Calculate accuracy
+                # Statistics
+                running_loss += loss.item()
                 pred = output.argmax(dim=1, keepdim=True)
-                correct_batch = pred.eq(target.view_as(pred)).sum().item()
-                correct += correct_batch
-                total_samples += len(target)
-                total_loss += loss.item()
-                num_batches += 1
+                correct += pred.eq(target.view_as(pred)).sum().item()
+                total += target.size(0)
                 
-                if i % 10 == 0:
-                    accuracy = 100. * correct_batch / len(target)
-                    print(f"Rank {self.rank}, Epoch {epoch}, Validation Batch {i}, Loss: {loss.item():.4f}, Acc: {accuracy:.2f}%")
+                # Print progress
+                if batch_idx % 50 == 0:
+                    batch_loss = loss.item()
+                    batch_acc = 100. * correct / total
+                    print(f'Validation [{batch_idx}/{len(self.val_loader)}] '
+                          f'Loss: {batch_loss:.4f} Acc: {batch_acc:.2f}%')
         
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0
-        avg_acc = 100. * correct / total_samples if total_samples > 0 else 0
-        print(f"Rank {self.rank}, Epoch {epoch} Validation Summary: Average Loss: {avg_loss:.4f}, Average Accuracy: {avg_acc:.2f}%")
+        val_time = time.time() - start_time
+        avg_loss = running_loss / len(self.val_loader)
+        avg_acc = 100. * correct / total
+        
+        print(f'\nEpoch {epoch} Validation Summary:')
+        print(f'  Average Loss: {avg_loss:.4f}')
+        print(f'  Average Accuracy: {avg_acc:.2f}%')
+        print(f'  Time: {val_time:.2f}s')
         
         # Log validation metrics
         self.stats.log_training_metrics({
@@ -220,7 +285,7 @@ class Worker:
         return avg_acc
 
 # Helper functions to be called by RPC
-from .rpc_ps import get_global_weights, update_global_parameters, report_global_metric
+from .rpc_ps import get_global_weights, update_global_parameters, report_global_metric, update_global_batchnorm_stats
 
 def run_worker(rank, world_size, master_addr, master_port, dataset_url, val_dataset_url, epochs, use_webdataset=False):
     os.environ['MASTER_ADDR'] = master_addr
