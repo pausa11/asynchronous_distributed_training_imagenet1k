@@ -1,0 +1,35 @@
+#!/bin/bash
+# Script para iniciar el Parameter Server
+# Este script debe ejecutarse en la PC que actuará como Parameter Server
+
+# Configuración
+WORLD_SIZE=3  # 1 PS + 2 Workers
+MASTER_PORT="30005"
+CHECKPOINT_DIR="checkpoints"
+
+# Obtener la IP de esta máquina
+# Intenta obtener la IP de la interfaz de red principal
+IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "localhost")
+
+echo "=========================================="
+echo "Starting Parameter Server"
+echo "=========================================="
+echo "IP Address: $IP"
+echo "Port: $MASTER_PORT"
+echo "World Size: $WORLD_SIZE"
+echo "Checkpoint Dir: $CHECKPOINT_DIR"
+echo "=========================================="
+echo ""
+echo "Para conectar workers desde otras máquinas, usa:"
+echo "  MASTER_ADDR=$IP"
+echo "  MASTER_PORT=$MASTER_PORT"
+echo "=========================================="
+echo ""
+
+# Iniciar el Parameter Server
+python -m src.rpc_ps \
+    --rank 0 \
+    --world_size $WORLD_SIZE \
+    --master_addr $IP \
+    --master_port $MASTER_PORT \
+    --checkpoint_dir $CHECKPOINT_DIR
