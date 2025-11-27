@@ -218,15 +218,70 @@ def run_ps(rank, world_size, master_addr, master_port, checkpoint_dir="checkpoin
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = master_port
     
-    # Fix for macOS network interface detection and IPv6 issues
-    # Force Gloo to use IPv4 only (Gloo has issues with IPv6 on macOS)
+    # Fix for network interface detection across different OS
+    # Force Gloo to use IPv4 only (Gloo has issues with IPv6)
     os.environ['GLOO_SOCKET_FAMILY'] = 'AF_INET'  # Force IPv4
     
     if master_addr != "localhost" and master_addr != "127.0.0.1":
-        # Set the network interface
-        os.environ['GLOO_SOCKET_IFNAME'] = 'en0'
-        os.environ['TP_SOCKET_IFNAME'] = 'en0'
-        print(f"Setting network interface to en0 (IPv4 only)")
+        # Detect network interface based on OS
+        import platform
+        import socket
+        
+        system = platform.system()
+        iface_name = None
+        
+        try:
+            if system == "Darwin":  # macOS
+                # Try common macOS interfaces
+                for iface in ['en0', 'en1', 'en2']:
+                    try:
+                        import subprocess
+                        result = subprocess.run(['ifconfig', iface], capture_output=True, text=True)
+                        if master_addr in result.stdout:
+                            iface_name = iface
+                            break
+                    except:
+                        continue
+                if not iface_name:
+                    iface_name = 'en0'  # Default fallback
+                    
+            elif system == "Linux":
+                # Try common Linux interfaces
+                import subprocess
+                result = subprocess.run(['ip', 'addr'], capture_output=True, text=True)
+                lines = result.stdout.split('\n')
+                current_iface = None
+                for line in lines:
+                    # Look for interface name (e.g., "2: eth0:")
+                    if ': ' in line and not line.startswith(' '):
+                        parts = line.split(': ')
+                        if len(parts) >= 2:
+                            current_iface = parts[1].split(':')[0].split('@')[0]
+                    # Look for inet address
+                    elif 'inet ' in line and master_addr in line:
+                        iface_name = current_iface
+                        break
+                
+                if not iface_name:
+                    # Fallback: try common names
+                    for iface in ['eth0', 'ens33', 'enp0s3', 'wlan0']:
+                        try:
+                            result = subprocess.run(['ip', 'addr', 'show', iface], capture_output=True, text=True)
+                            if result.returncode == 0 and 'inet ' in result.stdout:
+                                iface_name = iface
+                                break
+                        except:
+                            continue
+            
+            if iface_name:
+                os.environ['GLOO_SOCKET_IFNAME'] = iface_name
+                os.environ['TP_SOCKET_IFNAME'] = iface_name
+                print(f"Setting network interface to {iface_name} (IPv4 only)")
+            else:
+                print(f"Warning: Could not detect network interface, using default")
+                
+        except Exception as e:
+            print(f"Warning: Network interface detection failed: {e}")
     else:
         print(f"Using localhost (IPv4)")
     
