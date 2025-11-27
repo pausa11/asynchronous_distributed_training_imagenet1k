@@ -3,10 +3,10 @@
 # Este script puede ejecutarse en cualquier PC de la LAN
 
 # CONFIGURACIÓN - EDITA ESTOS VALORES
-MASTER_ADDR="localhost"  # Cambia esto a la IP del Parameter Server
+MASTER_ADDR="192.168.20.3"  # Cambia esto a la IP del Parameter Server
 MASTER_PORT="30005"
 WORKER_RANK=1  # Cambia esto: 1 para el primer worker, 2 para el segundo, etc.
-WORLD_SIZE=3   # 1 PS + 2 Workers (debe coincidir con el PS)
+WORLD_SIZE=2   # 1 PS + 2 Workers (debe coincidir con el PS)
 EPOCHS=5
 
 # Dataset configuration
@@ -34,7 +34,7 @@ if [ ! -d "$DATASET_URL" ]; then
 fi
 
 # Iniciar el Worker
-python -m src.rpc_worker \
+python run_worker.py \
     --rank $WORKER_RANK \
     --world_size $WORLD_SIZE \
     --master_addr $MASTER_ADDR \

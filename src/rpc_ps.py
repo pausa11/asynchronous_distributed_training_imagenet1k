@@ -231,17 +231,32 @@ def run_ps(rank, world_size, master_addr, master_port, checkpoint_dir="checkpoin
     )
     
     print("Parameter Server is running...")
-    # In a real scenario, we'd need a way to stop the PS gracefully or wait for workers.
-    # For now, we rely on RPC shutdown or external signal.
-    # But since run_ps blocks until shutdown? No, rpc.shutdown() blocks until all workers are done?
-    # Actually rpc.shutdown() waits for all workers to exit if they are joined.
+    print("Press Ctrl+C to stop the server")
     
-    # We need to access the global_ps to stop stats.
-    if global_ps:
-        global_ps.save_checkpoint("last.pth") # Save on exit
-        global_ps.stats.stop_monitoring()
+    # Keep the PS alive - wait indefinitely until interrupted
+    try:
+        import signal
+        import sys
         
-    rpc.shutdown()
+        def signal_handler(sig, frame):
+            print("\nShutting down Parameter Server...")
+            if global_ps:
+                global_ps.save_checkpoint("last.pth")
+                global_ps.stats.stop_monitoring()
+            rpc.shutdown()
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Block forever until signal received
+        signal.pause()
+    except KeyboardInterrupt:
+        print("\nShutting down Parameter Server...")
+        if global_ps:
+            global_ps.save_checkpoint("last.pth")
+            global_ps.stats.stop_monitoring()
+        rpc.shutdown()
 
 if __name__ == "__main__":
     import argparse

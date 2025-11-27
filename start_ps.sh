@@ -3,7 +3,7 @@
 # Este script debe ejecutarse en la PC que actuará como Parameter Server
 
 # Configuración
-WORLD_SIZE=3  # 1 PS + 2 Workers
+WORLD_SIZE=2  # 1 PS + 2 Workers
 MASTER_PORT="30005"
 CHECKPOINT_DIR="checkpoints"
 
@@ -27,7 +27,7 @@ echo "=========================================="
 echo ""
 
 # Iniciar el Parameter Server
-python -m src.rpc_ps \
+python run_ps.py \
     --rank 0 \
     --world_size $WORLD_SIZE \
     --master_addr $IP \
